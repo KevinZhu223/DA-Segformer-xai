@@ -1,0 +1,29 @@
+# Virtual Environment
+xai_venv/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Data & Models (Avoid pushing heavy binaries)
+*.safetensors
+*.pth
+*.ckpt
+*.h5
+checkpoint-*/
+BEST_MODELS_ARCHIVE/
+
+# Outputs
+outputs/
+v2/
+v3/
+viz_floodnet_FIXED_val/
+*.npy
+*.png
+*.jpg
+*.zip
+
+# OS/Editor
+.DS_Store
+.vscode/
+.idea/
