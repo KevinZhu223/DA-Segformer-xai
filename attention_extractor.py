@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import types
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from transformers import SegformerForSemanticSegmentation
@@ -57,8 +57,13 @@ class HookExtractor:
         extractor.remove_hooks()
     """
 
-    def __init__(self, model: SegformerForSemanticSegmentation) -> None:
+    def __init__(
+        self,
+        model: SegformerForSemanticSegmentation,
+        capture_keys: Optional[Set[AttnKey]] = None,
+    ) -> None:
         self.model = model
+        self.capture_keys = capture_keys
         self.attention_store: AttnStore = OrderedDict()
         self._hooks: list = []
         self._register()
@@ -72,6 +77,8 @@ class HookExtractor:
             for l in range(len(encoder.block[s])):
                 module = encoder.block[s][l].attention.self
                 key: AttnKey = (s, l)
+                if self.capture_keys is not None and key not in self.capture_keys:
+                    continue
 
                 def _hook(
                     _mod: torch.nn.Module,
@@ -147,8 +154,13 @@ class StealthExtractor:
         extractor.restore()
     """
 
-    def __init__(self, model: SegformerForSemanticSegmentation) -> None:
+    def __init__(
+        self,
+        model: SegformerForSemanticSegmentation,
+        capture_keys: Optional[Set[AttnKey]] = None,
+    ) -> None:
         self.model = model
+        self.capture_keys = capture_keys
         self.attention_store: AttnStore = OrderedDict()
         self._originals: Dict[AttnKey, object] = {}
         self._patch()
@@ -159,6 +171,8 @@ class StealthExtractor:
             for l in range(len(encoder.block[s])):
                 module = encoder.block[s][l].attention.self
                 key: AttnKey = (s, l)
+                if self.capture_keys is not None and key not in self.capture_keys:
+                    continue
 
                 # save the *bound* original
                 self._originals[key] = module.forward
@@ -239,6 +253,7 @@ class StealthExtractor:
 def build_extractor(
     model: SegformerForSemanticSegmentation,
     strategy: str = "hook",
+    capture_keys: Optional[Set[AttnKey]] = None,
 ) -> HookExtractor | StealthExtractor:
     """Factory: create an extractor by name.
 
@@ -247,7 +262,7 @@ def build_extractor(
     strategy : ``"hook"`` | ``"stealth"``
     """
     if strategy == "hook":
-        return HookExtractor(model)
+        return HookExtractor(model, capture_keys=capture_keys)
     if strategy == "stealth":
-        return StealthExtractor(model)
+        return StealthExtractor(model, capture_keys=capture_keys)
     raise ValueError(f"Unknown strategy {strategy!r}. Use 'hook' or 'stealth'.")

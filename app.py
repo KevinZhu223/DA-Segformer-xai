@@ -14,6 +14,7 @@ Designed for two audiences:
 from __future__ import annotations
 
 import io
+import hashlib
 import logging
 import os
 import sys
@@ -156,6 +157,94 @@ def _metric_html(value: str, label: str) -> str:
     )
 
 
+def _run_tab_safe(fn, *args):
+    """Render a tab without allowing one failure to blank subsequent tabs."""
+    try:
+        fn(*args)
+    except Exception as exc:
+        st.error(f"Tab rendering error: {exc}")
+
+
+def _attention_sanity_rows(result: XAIResult) -> list[dict]:
+    """Quick faithfulness checks for attention maps.
+
+    These are heuristic diagnostics to help users judge whether attention
+    is concentrated on semantically relevant regions.
+    """
+    pred = result.pred_mask
+    attn = result.attention_fused
+
+    p90 = float(np.percentile(attn, 90.0))
+    top_mask = attn >= p90
+
+    building_mask = np.isin(pred, BUILDING_CLASSES)
+    damage_mask = np.isin(pred, DAMAGE_CLASSES)
+
+    top_total = int(top_mask.sum())
+    top_total = max(top_total, 1)
+
+    top_on_buildings = float((top_mask & building_mask).sum()) / top_total
+    top_on_damage = float((top_mask & damage_mask).sum()) / top_total
+    building_coverage = float(building_mask.sum()) / pred.size
+    damage_coverage = float(damage_mask.sum()) / pred.size
+
+    return [
+        {
+            "Check": "Top-10% attention on buildings",
+            "Value": f"{100.0 * top_on_buildings:.1f}%",
+            "Interpretation": (
+                "Higher is usually better for damage-centric analysis; very low values suggest"
+                " the model is focusing on background context."
+            ),
+        },
+        {
+            "Check": "Top-10% attention on damaged buildings",
+            "Value": f"{100.0 * top_on_damage:.1f}%",
+            "Interpretation": (
+                "Useful when damage is present. Compare against image damage coverage to assess"
+                " whether attention is enriched in damaged areas."
+            ),
+        },
+        {
+            "Check": "Building pixel coverage",
+            "Value": f"{100.0 * building_coverage:.1f}%",
+            "Interpretation": "Context baseline: expected attention overlap should exceed this for targeted focus.",
+        },
+        {
+            "Check": "Damage pixel coverage",
+            "Value": f"{100.0 * damage_coverage:.1f}%",
+            "Interpretation": "Context baseline for damage-specific overlap.",
+        },
+    ]
+
+
+def _plain_language_summary(result: XAIResult) -> list[str]:
+    pred = result.pred_mask
+    attn = result.attention_fused
+
+    building_cov = float(np.isin(pred, BUILDING_CLASSES).mean())
+    damage_cov = float(np.isin(pred, DAMAGE_CLASSES).mean())
+
+    p90 = np.percentile(attn, 90.0)
+    top_mask = attn >= p90
+    top_on_buildings = float((top_mask & np.isin(pred, BUILDING_CLASSES)).sum()) / max(int(top_mask.sum()), 1)
+
+    points = [
+        f"Buildings occupy about {building_cov * 100:.1f}% of the image; predicted damage occupies {damage_cov * 100:.1f}%.",
+        f"Among the strongest 10% attention pixels, {top_on_buildings * 100:.1f}% fall on buildings.",
+    ]
+
+    if top_on_buildings < building_cov:
+        points.append(
+            "The model may be relying heavily on background context in this sample. Consider reviewing stage-wise maps or using the damage-only view."
+        )
+    else:
+        points.append(
+            "Attention is enriched on buildings relative to their area, which is typically desirable for damage analysis."
+        )
+    return points
+
+
 # ---------------------------------------------------------------------------
 #  Sidebar
 # ---------------------------------------------------------------------------
@@ -170,7 +259,7 @@ def sidebar_settings() -> dict:
     image_size = st.sidebar.selectbox(
         "Tile resolution (px)",
         [512, 768, 1024],
-        index=2,
+        index=1,
     )
 
     st.sidebar.markdown("---")
@@ -187,7 +276,7 @@ def sidebar_settings() -> dict:
         ),
     )
     last_layer_only = st.sidebar.checkbox(
-        "Last layer only (faster, lower memory)", value=False,
+        "Last layer only (faster, lower memory)", value=True,
     )
 
     st.sidebar.markdown("---")
@@ -249,14 +338,34 @@ def main():
         _show_landing_page()
         return
 
-    pil_img = Image.open(uploaded).convert("RGB")
+    image_bytes = uploaded.getvalue()
+    image_sig = hashlib.md5(image_bytes).hexdigest()
+    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img_w, img_h = pil_img.size
 
-    # Run inference
-    with st.spinner("Running inference and attention extraction ..."):
-        t0 = time.perf_counter()
-        result = pipe.run(pil_img, render_panels=True)
-        elapsed = time.perf_counter() - t0
+    infer_key = (
+        image_sig,
+        settings["checkpoint"],
+        settings["device"],
+        settings["image_size"],
+        settings["method"],
+        settings["last_layer_only"],
+    )
+
+    # Run expensive inference only when model-affecting settings change.
+    cached_key = st.session_state.get("xai_infer_key")
+    if cached_key != infer_key:
+        with st.spinner("Running inference and attention extraction ..."):
+            t0 = time.perf_counter()
+            result = pipe.run(pil_img, render_panels=True)
+            elapsed = time.perf_counter() - t0
+        st.session_state["xai_infer_key"] = infer_key
+        st.session_state["xai_result"] = result
+        st.session_state["xai_elapsed"] = elapsed
+    else:
+        result = st.session_state["xai_result"]
+        elapsed = st.session_state["xai_elapsed"]
+        st.caption("Using cached inference result. Visual updates are instant.")
 
     # Summary metrics bar
     _render_summary_bar(result, elapsed, img_w, img_h)
@@ -272,15 +381,15 @@ def main():
     ])
 
     with tabs[0]:
-        _tab_overview(result, settings)
+        _run_tab_safe(_tab_overview, result, settings)
     with tabs[1]:
-        _tab_stages(result, settings)
+        _run_tab_safe(_tab_stages, result, settings)
     with tabs[2]:
-        _tab_damage(result, settings)
+        _run_tab_safe(_tab_damage, result, settings)
     with tabs[3]:
-        _tab_stats(result, settings)
+        _run_tab_safe(_tab_stats, result, settings)
     with tabs[4]:
-        _tab_methodology()
+        _run_tab_safe(_tab_methodology)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +495,10 @@ def _tab_overview(result: XAIResult, settings: dict):
         legend = build_legend_image()
         st.image(_to_rgb(legend), width=280)
 
+    st.markdown("### Plain-Language Takeaway")
+    for point in _plain_language_summary(result):
+        st.markdown(f"- {point}")
+
 
 # ---------------------------------------------------------------------------
 #  Tab: Per-Stage Attention
@@ -462,22 +575,37 @@ def _tab_damage(result: XAIResult, settings: dict):
         and result.attention_damage.max() > 0
     )
 
-    if has_damage:
+    has_building = (
+        result.attention_building is not None
+        and result.attention_building.max() > 0
+    )
+
+    if has_damage or has_building:
         col1, col2 = st.columns(2)
+        overlay_d = None
+        overlay_b = None
+
         with col1:
-            hm = apply_colormap(result.attention_damage, settings["colormap"])
-            hm_r = cv2.resize(
-                hm,
-                (result.image_bgr.shape[1], result.image_bgr.shape[0]),
-            )
-            overlay_d = blend(result.image_bgr, hm_r, settings["alpha"])
-            st.image(
-                _to_rgb(overlay_d),
-                caption="Damage Attention (Minor / Major / Total Destruction)",
-                use_container_width=True,
-            )
+            if has_damage:
+                hm = apply_colormap(result.attention_damage, settings["colormap"])
+                hm_r = cv2.resize(
+                    hm,
+                    (result.image_bgr.shape[1], result.image_bgr.shape[0]),
+                )
+                overlay_d = blend(result.image_bgr, hm_r, settings["alpha"])
+                st.image(
+                    _to_rgb(overlay_d),
+                    caption="Damage Attention (Minor / Major / Total Destruction)",
+                    use_container_width=True,
+                )
+            else:
+                st.info(
+                    "No damaged-building pixels were predicted for this image. "
+                    "Showing building-level attention on the right."
+                )
+
         with col2:
-            if result.attention_building is not None:
+            if has_building:
                 hm_b = apply_colormap(
                     result.attention_building, settings["colormap"],
                 )
@@ -491,6 +619,8 @@ def _tab_damage(result: XAIResult, settings: dict):
                     caption="All Buildings Attention (incl. No Damage)",
                     use_container_width=True,
                 )
+            else:
+                st.info("No building pixels were predicted in this image.")
 
         # Analysis guidance
         with st.expander("Interpreting damage attention"):
@@ -510,12 +640,13 @@ def _tab_damage(result: XAIResult, settings: dict):
         with st.expander("Download damage analysis"):
             dcol1, dcol2 = st.columns(2)
             with dcol1:
-                st.download_button(
-                    "Download Damage Overlay (PNG)",
-                    data=_encode_png(_to_rgb(overlay_d)),
-                    file_name="damage_attention_overlay.png",
-                    mime="image/png",
-                )
+                if overlay_d is not None:
+                    st.download_button(
+                        "Download Damage Overlay (PNG)",
+                        data=_encode_png(_to_rgb(overlay_d)),
+                        file_name="damage_attention_overlay.png",
+                        mime="image/png",
+                    )
             with dcol2:
                 if result.panel_damage is not None:
                     st.download_button(
@@ -602,6 +733,14 @@ def _tab_stats(result: XAIResult, settings: dict):
             "Std Attention": f"{std_attn:.4f}",
         })
     st.dataframe(class_attn_rows, use_container_width=True, hide_index=True)
+
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.markdown("### Interpretability Sanity Checks")
+    st.markdown(
+        "Heuristic checks that help validate whether high-attention regions align "
+        "with semantically relevant areas (especially buildings and damage)."
+    )
+    st.dataframe(_attention_sanity_rows(result), use_container_width=True, hide_index=True)
 
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 

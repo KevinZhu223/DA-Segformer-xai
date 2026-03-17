@@ -70,6 +70,8 @@ def load_model(
     else:
         resolved = torch.device(device)
     logger.info("Using device: %s", resolved)
+    if resolved.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # ── Load model ────────────────────────────────────────────────────
     logger.info("Loading model from %s …", ckpt_path)

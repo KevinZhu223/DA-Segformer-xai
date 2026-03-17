@@ -44,6 +44,7 @@ from config import (
     DAMAGE_CLASSES,
     HEATMAP_ALPHA,
     HEATMAP_COLORMAP,
+    SEGFORMER_DEPTHS,
     IGNORE_INDEX,
     IMAGE_SIZE,
     NUM_CLASSES,
@@ -122,7 +123,7 @@ class XAIPipeline:
         checkpoint: Optional[str] = None,
         device: Optional[str] = None,
         image_size: int = IMAGE_SIZE,
-        stride: int = 768,
+        stride: Optional[int] = None,
         extraction_strategy: str = "hook",
         attention_method: str = "received",
         last_layer_only: bool = False,
@@ -131,11 +132,13 @@ class XAIPipeline:
     ) -> None:
         self.image_size = image_size
         self.crop_size = image_size
-        self.stride = stride
+        # Keep 25% overlap by default for any tile size.
+        self.stride = stride if stride is not None else int(round(image_size * 0.75))
         self.attention_method = attention_method
         self.last_layer_only = last_layer_only
         self.colormap = colormap
         self.alpha = alpha
+        self._strategy = extraction_strategy
 
         # ── Load model ────────────────────────────────────────────────
         self.model, self._raw_processor, self.device = load_model(
@@ -150,13 +153,41 @@ class XAIPipeline:
         )
 
         # ── Attach attention extractor ────────────────────────────────
-        self.extractor = build_extractor(self.model, strategy=extraction_strategy)
-        self._strategy = extraction_strategy
+        self._capture_last_only = bool(last_layer_only)
+        self.extractor = self._build_extractor(capture_last_only=self._capture_last_only)
         logger.info(
             "Pipeline ready  [%s | %s | %s | crop=%d stride=%d].",
             self.device, extraction_strategy, attention_method,
             self.crop_size, self.stride,
         )
+
+    def _capture_keys(self, capture_last_only: bool):
+        if not capture_last_only:
+            return None
+        return {
+            (stage_idx, depth - 1)
+            for stage_idx, depth in enumerate(SEGFORMER_DEPTHS)
+        }
+
+    def _build_extractor(self, capture_last_only: bool):
+        return build_extractor(
+            self.model,
+            strategy=self._strategy if hasattr(self, "_strategy") else "hook",
+            capture_keys=self._capture_keys(capture_last_only),
+        )
+
+    def _ensure_extractor_profile(self) -> None:
+        desired = bool(self.last_layer_only)
+        if desired == self._capture_last_only:
+            return
+
+        if hasattr(self.extractor, "remove_hooks"):
+            self.extractor.remove_hooks()
+        if hasattr(self.extractor, "restore"):
+            self.extractor.restore()
+
+        self.extractor = self._build_extractor(capture_last_only=desired)
+        self._capture_last_only = desired
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  2-D Hanning window for smooth tile blending
@@ -223,10 +254,18 @@ class XAIPipeline:
         pixel_values = inputs["pixel_values"].to(self.device)
 
         use_output_attentions = self._strategy == "hook"
-        outputs = self.model(
-            pixel_values=pixel_values,
-            output_attentions=use_output_attentions,
-        )
+        use_fast_amp = self.device.type == "cuda" and self.last_layer_only
+        if use_fast_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = self.model(
+                    pixel_values=pixel_values,
+                    output_attentions=use_output_attentions,
+                )
+        else:
+            outputs = self.model(
+                pixel_values=pixel_values,
+                output_attentions=use_output_attentions,
+            )
 
         # Upsample logits to tile size and compute probabilities
         logits = outputs.logits  # (1, C, H/4, W/4)
@@ -427,6 +466,9 @@ class XAIPipeline:
 
         image_rgb = np.array(pil_img)
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+        # Reconfigure extraction hooks if runtime settings changed.
+        self._ensure_extractor_profile()
 
         # ── Sliding-window inference + attention ──────────────────────
         pred_mask, fused_norm, stage_norms = self._smooth_stitch(image_rgb)
